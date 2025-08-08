@@ -18,17 +18,48 @@ from security.models import User
 logger = logging.getLogger(__name__)
 
 
+from django.views.decorators.http import require_http_methods
+from django.views.decorators.csrf import csrf_protect
+
+@require_http_methods(["GET"])
+@csrf_protect
 def get_user(request, user_id):
-    """Secure user retrieval using Django ORM"""
+    """Secure user retrieval using Django ORM
+    
+    Args:
+        request: HTTP request object
+        user_id: User ID to retrieve
+        
+    Returns:
+        JsonResponse with user data or error message
+        
+    Security:
+        - Restricted to GET method only
+        - CSRF protection enabled
+        - Input validation
+        - Error logging
+    """
+    if request.method != 'GET':
+        logger.warning(f"Unauthorized method {request.method} attempted for user {user_id}")
+        return JsonResponse({'error': 'Method not allowed'}, status=405)
+        
     try:
+        # Validate user_id is positive integer
+        if not isinstance(user_id, int) or user_id < 1:
+            raise ValueError("Invalid user ID format")
+            
         user = get_object_or_404(User, id=user_id)
+        
+        # Log successful access
+        logger.info(f"User {user_id} retrieved successfully")
+        
         return JsonResponse({
             'id': user.id,
             'name': user.name
         })
-    except ValueError:
+    except ValueError as e:
         logger.warning(f"Invalid user ID attempted: {user_id}")
-        return JsonResponse({'error': 'Invalid user ID'}, status=400)
+        return JsonResponse({'error': str(e)}, status=400)
     except Exception as e:
         logger.error(f"Error retrieving user: {str(e)}")
         return JsonResponse({'error': 'Internal server error'}, status=500)

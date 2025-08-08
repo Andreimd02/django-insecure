@@ -3,7 +3,7 @@ from django.contrib.auth.decorators import login_required
 from . import views
 
 urlpatterns = [
-    # Secure user management
+    # Secure user management - GET only
     path('users/<int:user_id>/', views.get_user, name='get_user'),
     
     # Protected admin area
