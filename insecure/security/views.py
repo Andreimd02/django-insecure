@@ -1,30 +1,37 @@
 import json
 import os
-import pickle
+import logging
+from pathlib import Path
+from typing import Optional
 from dataclasses import dataclass
-import base64
 
 from django.http import HttpResponse, JsonResponse
-from django.utils.safestring import mark_safe
+from django.shortcuts import get_object_or_404
+from django.core.exceptions import ValidationError
+from django.utils.html import escape
+from django.conf import settings
+from django.contrib.auth.decorators import login_required
+import jwt
 
 from security.models import User
 
-
-def unsafe_users(request, user_id):
-    """SQL injection"""
-
-    users = User.objects.raw(f'SELECT * FROM security_user WHERE id = {user_id}')
-
-    return HttpResponse(users)
+logger = logging.getLogger(__name__)
 
 
-# http://127.0.0.1:8000/security/safe/users/1
-def safe_users(request, user_id):
-    """Uses parameterised query so it's fine"""
-
-    users = User.objects.raw('SELECT * FROM security_user WHERE id = %s', (user_id,))
-
-    return HttpResponse(users)
+def get_user(request, user_id):
+    """Secure user retrieval using Django ORM"""
+    try:
+        user = get_object_or_404(User, id=user_id)
+        return JsonResponse({
+            'id': user.id,
+            'name': user.name
+        })
+    except ValueError:
+        logger.warning(f"Invalid user ID attempted: {user_id}")
+        return JsonResponse({'error': 'Invalid user ID'}, status=400)
+    except Exception as e:
+        logger.error(f"Error retrieving user: {str(e)}")
+        return JsonResponse({'error': 'Internal server error'}, status=500)
 
 
 def read_file(request, filename):
@@ -64,35 +71,81 @@ print(encoded_user)
 # b'\x80\x03csecurity.views\nTestUser\nq\x00)\x81q\x01}q\x02X\x05\x00\x00\x00permsq\x03K\x01sb.'
 # b'gANjc2VjdXJpdHkudmlld3MKVGVzdFVzZXIKcQApgXEBfXECWAUAAABwZXJtc3EDSwFzYi4='
 
+@login_required
 def admin_index(request):
-    """Protected admin page which can be broken into by manipulating a token"""
-
-    token = base64.b64decode(request.COOKIES.get('silly_token', ''))
-    user = pickle.loads(token)
-
-    if user.perms == 1:
-        return HttpResponse('Hello Admin')
-
-    return HttpResponse('No access')
+    """Protected admin page using JWT authentication"""
+    try:
+        token = request.COOKIES.get('admin_token')
+        if not token:
+            logger.warning(f"Admin access attempted without token from IP: {request.META.get('REMOTE_ADDR')}")
+            return JsonResponse({'error': 'No token provided'}, status=401)
+            
+        payload = jwt.decode(
+            token, 
+            settings.SECRET_KEY,
+            algorithms=['HS256']
+        )
+        
+        if payload.get('role') != 'admin':
+            logger.warning(f"Non-admin access attempted with token from IP: {request.META.get('REMOTE_ADDR')}")
+            return JsonResponse({'error': 'Insufficient permissions'}, status=403)
+            
+        return JsonResponse({'message': 'Hello Admin'})
+    except jwt.InvalidTokenError:
+        logger.error(f"Invalid admin token attempted from IP: {request.META.get('REMOTE_ADDR')}")
+        return JsonResponse({'error': 'Invalid token'}, status=401)
+    except Exception as e:
+        logger.error(f"Admin access error: {str(e)}")
+        return JsonResponse({'error': 'Internal server error'}, status=500)
 
 
 # http://127.0.0.1:8000/security/search?query=%3Cscript%3Enew%20Image().src=%22http://127.0.0.1:8000/security/log?string=%22.concat(document.cookie)%3C/script%3E
+@dataclass
+class SearchParams:
+    query: str
+    
+    def validate(self) -> None:
+        if not self.query:
+            raise ValidationError("Search query cannot be empty")
+        if len(self.query) > 100:
+            raise ValidationError("Search query too long")
+        if any(char in self.query for char in '<>{}'):
+            raise ValidationError("Invalid characters in search query")
+
 def search(request):
-    """Search functionality prone to XSS"""
-
-    query = request.GET.get('query', '')
-
-    response = HttpResponse(f"Query: {query}")
-
-    # Override browser's protection, if exsits
-    response['X-XSS-Protection'] = 0
-
-    return response
+    """Secure search functionality with input validation"""
+    try:
+        params = SearchParams(query=request.GET.get('query', ''))
+        params.validate()
+        
+        safe_query = escape(params.query)
+        logger.info(f"Search performed with query: {safe_query}")
+        
+        return JsonResponse({
+            'query': safe_query,
+            'results': []  # Implementar lógica de busca aqui
+        })
+    except ValidationError as e:
+        logger.warning(f"Invalid search query attempted: {str(e)}")
+        return JsonResponse({'error': str(e)}, status=400)
+    except Exception as e:
+        logger.error(f"Search error: {str(e)}")
+        return JsonResponse({'error': 'Internal server error'}, status=500)
 
 def log(request):
-    """Just print whatever was received"""
-    string = request.GET.get('string', '')
-
-    print(string)
-
-    return HttpResponse()
+    """Secure logging functionality"""
+    try:
+        string = request.GET.get('string', '')
+        if len(string) > 200:
+            raise ValidationError("Log string too long")
+            
+        safe_string = escape(string)
+        logger.info(f"Log entry: {safe_string}")
+        
+        return JsonResponse({'status': 'logged'})
+    except ValidationError as e:
+        logger.warning(f"Invalid log attempt: {str(e)}")
+        return JsonResponse({'error': str(e)}, status=400)
+    except Exception as e:
+        logger.error(f"Logging error: {str(e)}")
+        return JsonResponse({'error': 'Internal server error'}, status=500)
