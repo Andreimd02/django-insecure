@@ -1,9 +1,13 @@
 import json
 import os
 import logging
+import re
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from dataclasses import dataclass
+from django.views.decorators.http import require_http_methods
+from django.views.decorators.csrf import csrf_protect
 
 from django.http import HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404
@@ -131,6 +135,11 @@ def admin_index(request):
 
 
 # http://127.0.0.1:8000/security/search?query=%3Cscript%3Enew%20Image().src=%22http://127.0.0.1:8000/security/log?string=%22.concat(document.cookie)%3C/script%3E
+from django.views.decorators.http import require_http_methods
+from django.views.decorators.csrf import csrf_protect
+from typing import Optional
+import re
+
 @dataclass
 class SearchParams:
     query: str
@@ -140,43 +149,113 @@ class SearchParams:
             raise ValidationError("Search query cannot be empty")
         if len(self.query) > 100:
             raise ValidationError("Search query too long")
-        if any(char in self.query for char in '<>{}'):
-            raise ValidationError("Invalid characters in search query")
+        if not re.match(r'^[a-zA-Z0-9\s\-_.,]+$', self.query):
+            raise ValidationError("Query contains invalid characters")
+        
+    def sanitize(self) -> str:
+        return escape(self.query.strip())
 
+@dataclass
+class LogParams:
+    string: str
+    
+    def validate(self) -> None:
+        if len(self.string) > 200:
+            raise ValidationError("Log string too long")
+        if not re.match(r'^[a-zA-Z0-9\s\-_.,]+$', self.string):
+            raise ValidationError("Log string contains invalid characters")
+            
+    def sanitize(self) -> str:
+        return escape(self.string.strip())
+
+@require_http_methods(["GET"])
+@csrf_protect
 def search(request):
-    """Secure search functionality with input validation"""
+    """Secure search functionality with input validation and method restriction
+    
+    Args:
+        request: HTTP request object containing the search query
+        
+    Returns:
+        JsonResponse with sanitized query and results or error message
+        
+    Security:
+        - Restricted to GET method only
+        - CSRF protection enabled
+        - Input validation and sanitization
+        - Error logging
+        - Rate limiting (via settings)
+    """
+    if not request.GET.get('query'):
+        return JsonResponse({'error': 'Missing search query'}, status=400)
+        
     try:
         params = SearchParams(query=request.GET.get('query', ''))
         params.validate()
         
-        safe_query = escape(params.query)
-        logger.info(f"Search performed with query: {safe_query}")
+        safe_query = params.sanitize()
+        logger.info(f"Search performed with query: {safe_query} from IP: {request.META.get('REMOTE_ADDR')}")
+        
+        # Implementar cache para prevenir ataques de DoS
+        # cache_key = f"search_{safe_query}"
+        # results = cache.get(cache_key)
         
         return JsonResponse({
             'query': safe_query,
-            'results': []  # Implementar lógica de busca aqui
+            'results': [],  # Implementar lógica de busca aqui
+            'timestamp': datetime.now().isoformat()
         })
     except ValidationError as e:
-        logger.warning(f"Invalid search query attempted: {str(e)}")
+        logger.warning(f"Invalid search query attempted: {str(e)} from IP: {request.META.get('REMOTE_ADDR')}")
         return JsonResponse({'error': str(e)}, status=400)
     except Exception as e:
-        logger.error(f"Search error: {str(e)}")
+        logger.error(f"Search error: {str(e)}", exc_info=True)
         return JsonResponse({'error': 'Internal server error'}, status=500)
 
+@require_http_methods(["POST"])
+@csrf_protect
 def log(request):
-    """Secure logging functionality"""
-    try:
-        string = request.GET.get('string', '')
-        if len(string) > 200:
-            raise ValidationError("Log string too long")
-            
-        safe_string = escape(string)
-        logger.info(f"Log entry: {safe_string}")
+    """Secure logging functionality with input validation and method restriction
+    
+    Args:
+        request: HTTP request object containing the log string
         
-        return JsonResponse({'status': 'logged'})
+    Returns:
+        JsonResponse with confirmation or error message
+        
+    Security:
+        - Restricted to POST method only
+        - CSRF protection enabled
+        - Input validation and sanitization
+        - Error logging
+        - Rate limiting (via settings)
+    """
+    if not request.POST.get('string'):
+        return JsonResponse({'error': 'Missing log string'}, status=400)
+        
+    try:
+        params = LogParams(string=request.POST.get('string', ''))
+        params.validate()
+        
+        safe_string = params.sanitize()
+        
+        # Adicionar informações de contexto ao log
+        log_context = {
+            'ip_address': request.META.get('REMOTE_ADDR'),
+            'user_agent': request.META.get('HTTP_USER_AGENT'),
+            'timestamp': datetime.now().isoformat(),
+            'message': safe_string
+        }
+        
+        logger.info('Log entry received', extra=log_context)
+        
+        return JsonResponse({
+            'status': 'logged',
+            'timestamp': log_context['timestamp']
+        })
     except ValidationError as e:
-        logger.warning(f"Invalid log attempt: {str(e)}")
+        logger.warning(f"Invalid log attempt: {str(e)} from IP: {request.META.get('REMOTE_ADDR')}")
         return JsonResponse({'error': str(e)}, status=400)
     except Exception as e:
-        logger.error(f"Logging error: {str(e)}")
+        logger.error(f"Logging error: {str(e)}", exc_info=True)
         return JsonResponse({'error': 'Internal server error'}, status=500)
